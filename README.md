@@ -133,7 +133,7 @@ required setting, stops the exporter at startup with a message.
 ### Command line
 
 ```
-python deluge_exporter.py [--once] [--log-level LEVEL] [--version]
+python deluge_exporter.py [--once] [--healthcheck] [--log-level LEVEL] [--version]
 ```
 
 `--once` runs a single cycle and exits: `0` on success, `1` on failure. Configuration errors exit
@@ -310,6 +310,64 @@ from(bucket: "deluge")
   |> filter(fn: (r) => r._measurement == "torrent" and r._field == "tracker_ok")
   |> last()
   |> filter(fn: (r) => r._value == 0)
+```
+
+## Grafana dashboards
+
+Three versions of one sample dashboard, with the same panels in each store's query language:
+
+| File | Data source | Settings at the top of the dashboard |
+|---|---|---|
+| [`grafana/deluge-victoriametrics.json`](grafana/deluge-victoriametrics.json) | VictoriaMetrics or Prometheus (PromQL) | **Data source**, and **db label**: the exporter's `INFLUXDB_DATABASE` (`deluge` by default) |
+| [`grafana/deluge-influxdb1.json`](grafana/deluge-influxdb1.json) | InfluxDB 1.x (InfluxQL) | **Data source**: an InfluxQL data source whose database is the exporter's `INFLUXDB_DATABASE` |
+| [`grafana/deluge-influxdb2.json`](grafana/deluge-influxdb2.json) | InfluxDB 2.x (Flux) | **Data source**: a Flux data source, and **Bucket**: the exporter's `INFLUXDB_BUCKET` (`deluge` by default) |
+
+Import one under **Dashboards → New → Import**, then pick the data source at the top.
+
+It has three rows:
+- **Overview:** torrent counts, torrents that cannot finish, errors (state, Deluge message or
+  tracker), free space, whether the port is reachable, blocklist age.
+- **Transfer:** rates, upload by label, torrents by state, peers, corrupt data and disk queue.
+- **Torrents:** a table with state, progress, ratio, seeding time, size, availability, tracker
+  status and upload rate per torrent, plus disk used by label, the least-seeded torrents and the
+  torrents idle longest.
+
+Queries aggregate per torrent rather than per series, so they also work with `YEAR_TAG=true`.
+
+The InfluxDB versions differ in two small ways:
+- **Elapsed times show as dates.** InfluxQL cannot do arithmetic with the current time, so
+  "days since" values show as "3 days ago" instead.
+- **Short top-10 lists are tables** rather than bar charts.
+
+## Health check
+
+The image has a Docker `HEALTHCHECK`, so `docker ps`, Portainer, Homepage and similar tools show
+the container as `healthy` or `unhealthy`.
+
+The container is **healthy while a cycle has written successfully within the last 3 × `INTERVAL`
+seconds**: 90 seconds at the default `INTERVAL` of 30. A plain "is the process running" check would
+not be enough here, because the exporter deliberately keeps running when Deluge or the
+database is unreachable, logging each failed cycle and retrying.
+
+How it works:
+
+- After each successful write, the exporter stamps a small heartbeat file in `/tmp`, and it removes
+  that file at startup so a stamp from before a restart cannot count.
+- Docker runs `python deluge_exporter.py --healthcheck` every 30 seconds (60-second start period, 2
+  retries). It exits `0` when the heartbeat is recent enough and `1` otherwise, printing why. Run
+  `docker inspect --format '{{json .State.Health}}' <container>` to see that output.
+- It reads only `INTERVAL`, so it works without the other settings.
+
+Docker only reports the status: it does not restart an unhealthy container, and almost every
+failure is upstream anyway, so a restart would not fix it. For alerts, use your monitoring stack,
+for example an alert when the exporter's series stop arriving.
+
+To change the timings, override them in Compose:
+
+```yaml
+    healthcheck:
+      interval: 60s
+      start_period: 120s
 ```
 
 ## Load and cardinality

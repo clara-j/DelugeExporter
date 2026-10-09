@@ -1,6 +1,10 @@
+import contextlib
 import http.server
+import io
 import json
 import os
+import tempfile
+import time
 import sys
 import threading
 import unittest
@@ -9,6 +13,17 @@ import urllib.parse
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import deluge_exporter as de  # noqa: E402
+
+_HEARTBEAT_DIR = tempfile.TemporaryDirectory()
+
+
+def setUpModule():
+    # Every test that runs the exporter would otherwise stamp the real /tmp heartbeat.
+    de.HEARTBEAT_FILE = os.path.join(_HEARTBEAT_DIR.name, "heartbeat")
+
+
+def tearDownModule():
+    _HEARTBEAT_DIR.cleanup()
 
 TS = 1791500000123  # 2026-10-08 UTC
 
@@ -223,6 +238,62 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config(INFLUXDB_TOKEN="t", INFLUXDB_ORG="o", INFLUXDB_BUCKET="b").influxdb_bucket, "b")
         with self.assertRaises(de.ConfigError):
             config(INFLUXDB_TOKEN="t0k")
+
+
+class HealthcheckTests(unittest.TestCase):
+    def setUp(self):
+        if os.path.exists(de.HEARTBEAT_FILE):
+            os.remove(de.HEARTBEAT_FILE)
+
+    def check(self, env=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = de.healthcheck(env or {})
+        return code, out.getvalue()
+
+    def stamp(self, seconds_ago):
+        with open(de.HEARTBEAT_FILE, "w") as f:
+            f.write(repr(time.time() - seconds_ago))
+
+    def test_no_heartbeat_is_unhealthy(self):
+        self.assertEqual(self.check()[0], 1)
+
+    def test_fresh_and_stale(self):
+        self.stamp(10)
+        self.assertEqual(self.check(), (0, "healthy: last successful write 10s ago\n"))
+        self.stamp(100)  # default INTERVAL 30: limit 90s
+        code, text = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("limit 90s", text)
+        self.assertEqual(self.check({"INTERVAL": "60"})[0], 0)  # limit 180s
+
+    def test_bad_interval_or_file_is_unhealthy(self):
+        self.stamp(1)
+        self.assertEqual(self.check({"INTERVAL": "ten"})[0], 1)
+        with open(de.HEARTBEAT_FILE, "w") as f:
+            f.write("garbage")
+        self.assertEqual(self.check()[0], 1)
+
+    def test_main_healthcheck_needs_no_other_settings(self):
+        self.stamp(1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(de.main(["--healthcheck"], env={}), 0)
+
+    def test_success_writes_heartbeat_failure_does_not(self):
+        de.Exporter(config(), FakeDeluge(result()), FakeWriter()).run(once=True)
+        self.assertEqual(self.check()[0], 0)
+        os.remove(de.HEARTBEAT_FILE)
+        with self.assertLogs("deluge-exporter", level="WARNING"):
+            de.Exporter(config(), FakeDeluge(de.DelugeError("down")), FakeWriter()).run(once=True)
+        self.assertFalse(os.path.exists(de.HEARTBEAT_FILE))
+
+    def test_unwritable_heartbeat_does_not_raise(self):
+        saved = de.HEARTBEAT_FILE
+        de.HEARTBEAT_FILE = os.path.join(_HEARTBEAT_DIR.name, "missing-dir", "heartbeat")
+        try:
+            de.write_heartbeat()
+        finally:
+            de.HEARTBEAT_FILE = saved
 
 
 class StubHandler(http.server.BaseHTTPRequestHandler):

@@ -14,17 +14,23 @@ import os
 import signal
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 REQUEST_TIMEOUT_SECONDS = 10
 SUMMARY_EVERY_SECONDS = 3600
 ALERT_AFTER_FAILURES = 10
 DEFAULT_PASSWORD = "deluge"
+# Docker HEALTHCHECK: every successful cycle stamps this file, and
+# `--healthcheck` reports unhealthy once it is older than
+# HEALTHY_WITHIN_INTERVALS polls.
+HEARTBEAT_FILE = os.path.join(tempfile.gettempdir(), "deluge-exporter.heartbeat")
+HEALTHY_WITHIN_INTERVALS = 3
 
 TORRENT_PARAMS = ["name", "state", "progress", "num_seeds", "total_seeds", "num_peers", "total_peers",
                   "download_payload_rate", "upload_payload_rate", "ratio", "tracker_host", "total_done",
@@ -378,6 +384,7 @@ class Exporter:
             cycles += 1
             try:
                 torrents = self.run_cycle()
+                write_heartbeat()
                 ok += 1
                 if consecutive:
                     log.info("recovered after %d failed cycle(s) since %s", consecutive, failing_since)
@@ -400,13 +407,49 @@ class Exporter:
             time.sleep(max(0.0, self.config.interval - (time.monotonic() - started)))
 
 
+def write_heartbeat():
+    """Record a successful write for --healthcheck. Never raises: a full or
+    read-only /tmp must not stop the exporter."""
+    try:
+        with open(HEARTBEAT_FILE + ".tmp", "w") as f:
+            f.write(repr(time.time()))
+        os.replace(HEARTBEAT_FILE + ".tmp", HEARTBEAT_FILE)
+    except OSError as e:
+        log.debug("heartbeat not written: %s", one_line(e))
+
+
+def healthcheck(env):
+    """Exit status for Docker's HEALTHCHECK: 0 if a cycle wrote successfully
+    within HEALTHY_WITHIN_INTERVALS x INTERVAL seconds, else 1."""
+    try:
+        limit = HEALTHY_WITHIN_INTERVALS * _env_int(env, "INTERVAL", 30)
+    except ConfigError as e:
+        print("unhealthy: {0}".format(e))
+        return 1
+    try:
+        with open(HEARTBEAT_FILE) as f:
+            age = time.time() - float(f.read().strip())
+    except (OSError, ValueError):
+        print("unhealthy: no successful write since the exporter started")
+        return 1
+    if age > limit:
+        print("unhealthy: last successful write {0:.0f}s ago (limit {1}s)".format(age, limit))
+        return 1
+    print("healthy: last successful write {0:.0f}s ago".format(age))
+    return 0
+
+
 def main(argv=None, env=None):
     parser = argparse.ArgumentParser(description="Export Deluge metrics to InfluxDB line protocol.")
     parser.add_argument("--once", action="store_true", help="run one cycle and exit (1 on failure)")
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"),
                         help="DEBUG adds one line per cycle (env LOG_LEVEL)")
+    parser.add_argument("--healthcheck", action="store_true",
+                        help="exit 0 if a write succeeded recently, else 1 (for Docker HEALTHCHECK)")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args(argv)
+    if args.healthcheck:
+        return healthcheck(os.environ if env is None else env)
     logging.basicConfig(stream=sys.stdout, format="%(asctime)s %(levelname)s %(message)s",
                         level=getattr(logging, args.log_level.upper(), logging.INFO))
     try:
@@ -416,6 +459,10 @@ def main(argv=None, env=None):
         return 2
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:  # a heartbeat left from before a restart must not count as fresh
+        os.remove(HEARTBEAT_FILE)
+    except OSError:
+        pass
     target = ("bucket={0} org={1} (InfluxDB 2 API)".format(config.influxdb_bucket, config.influxdb_org)
               if config.influxdb_token else "db={0}".format(config.influxdb_database))
     log.info("starting %s: deluge=%s influxdb=%s %s interval=%ds year_tag=%s",
